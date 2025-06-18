@@ -1,133 +1,131 @@
 
-# 🔐 HardenedEntropyCipher V3 - Uma Cifra Entrópica Moderna com Proteções Contra Brute Force, Replay e Análise Estática
+# 🔐 HardenedEntropyCipher V3 (C Edition) - Projeto de Louco com Paranoia em Camadas 
 
-## 📜 Resumo Técnico
+## 📌 Sobre
 
-A **HardenedEntropyCipher V3** é uma cifra de propósito geral, projetada com foco em:
+A **HardenedEntropyCipher V3 (C Edition)** é uma cifra experimental, totalmente overengineered, criada com o objetivo único de ser difícil de quebrar, difícil de analisar e, provavelmente, difícil de entender.
 
-- ✅ Alta entropia de saída
-- ✅ Forward secrecy por sessão
-- ✅ Resiliência contra ataques de brute force e análise de fluxo
-- ✅ Camadas de ofuscação, compressão inteligente e inserção pseudoaleatória de ruído
-- ✅ Sistema de versionamento para compatibilidade futura
-- ✅ Integração de KDF multi-camada com múltiplas funções hash (PBKDF2-SHA256, PBKDF2-SHA512, Blake2b)
+> ⚠️ **AVISO DE SANIDADE:**  
+Este projeto nasceu de uma mente paranoica e é fruto de insônia + café + ódio por padrões simples demais.  
+**Não existe auditoria externa, nem compliance FIPS, nem NIST. Só caos.**
 
-## 🧬 Modelos Matemáticos Utilizados
+---
 
-### 1. Derivação de Chave (Advanced KDF)
+## 📜 Principais Características
 
-**Fórmula Base de Derivação:**
+- ✅ Criptografia AEAD moderna (ChaCha20-Poly1305 IETF via libsodium)
+- ✅ Derivação de chave com Argon2id (OPSLIMIT_INTERACTIVE / MEMLIMIT_INTERACTIVE)
+- ✅ Controle de versão de payload (`VERSION_BYTE`)
+- ✅ Header autenticado (AEAD + Additional Data)
+- ✅ Proteção contra replay via timestamp
+- ✅ Validação de senha com análise de entropia + verificação de classes de caracteres
+- ✅ Zeroização manual de buffers sensíveis
+- ✅ Payload Hex-safe para transporte por canais inseguros
+- ✅ Limitação de tamanho de payload para evitar DoS (64KB máximo)
 
-```
-K_final = Blake2b(PBKDF2_SHA256(MK, PS, N) || PBKDF2_SHA512(MK, S, N/2), key=PS[0:32])
-```
+---
 
-**Onde:**
+## 📈 Comparação com Outras Cifras Conhecidas
 
-- MK = Master Key
-- S = Salt aleatório por sessão
-- PS = Purpose Salt (SHA-256(MK, Purpose, Salt))
-- N = Iterações dinâmicas (~120.000+ rounds)
+| Recurso | AES-GCM | ChaCha20-Poly1305 | HardenedEntropyCipher V3 |
+|---|---|---|---|
+| Validação de senha embutida | ❌ | ❌ | ✅ |
+| Header customizado com versionamento | ❌ | ❌ | ✅ |
+| Timestamp Anti-Replay | ❌ | ❌ | ✅ |
+| Buffer zeroization manual | Parcial | Parcial | ✅ |
+| Output pronto pra transporte em Hex | ❌ | ❌ | ✅ |
+| Dependência de libs | OpenSSL | Libsodium | Libsodium |
+| Performance | Alta | Alta | Baixa 😂 |
+| Produção Ready | ✅ | ✅ | ❌ Experimental |
 
-### 2. PRNG Customizado para Entropia (LCG Modificado)
+---
 
-Modelo de PRNG usado para posicionamento de entropia dentro do payload:
-
-```
-X[n+1] = (a * X[n] + c) mod m
-```
-
-Com múltiplas iterações por ciclo para aumentar a distribuição:
-
-- a = 1664525
-- c = 1013904223
-- m = 2^32
-
-Seed inicial derivado de:
+## 📐 Estrutura do Payload
 
 ```
-Seed = int(SHA-256(MK || Salt || Session_ID || Purpose)[0:8])
+[1 byte Versão] +
+[24 bytes Salt] +
+[12 bytes Nonce] +
+[8 bytes Timestamp] +
+[Ciphertext + MAC (16 bytes)]
 ```
 
-### 3. Camadas de Criptografia
+---
 
-- **Camada 1:** AES-256-CBC com IV aleatório
-- **Camada 2:** ChaCha20 com nonce derivado
-- **Camada 3:** Entropia embarcada (pseudoaleatória) com fator de expansão definido pelo usuário (`entropy_ratio`)
-
-### 4. HMAC Final
-
-HMAC SHA-256 com chave derivada independente (50000 rounds):
-
-```
-MAC = HMAC_SHA256(K_mac, Data)
-```
-
-## 🎛️ Estrutura do Payload
-
-```
-[1 byte Versão] + [24 bytes Salt] + [16 bytes IV] + [8 bytes Session_ID] +
-[4 bytes Cipher_len] + [1 byte Entropy Ratio] + [1 byte Flags] +
-[4 bytes Timestamp XOR] + [4 bytes KDF Rounds] + [1 byte Seed Length] +
-[Seed_bytes] + [Payload + Entropy] + [32 bytes HMAC]
-```
-
-## 🎯 Proteções Incluídas
+## 🛡️ Proteções Incluídas
 
 | Proteção | Status |
 |---|---|
-| Proteção contra replay | ✅ |
-| Brute force natural (CPU cost) | ✅ |
-| Forward secrecy | ✅ |
-| Entropy Injection (Noise Obfuscation) | ✅ |
-| Timing Attack Resistance | ✅ |
-| Tamper detection via HMAC | ✅ |
-| Header versioning | ✅ |
-| Compression side-channel mitigation | ✅ |
+| Senha fraca rejeitada | ✅ |
+| Resistência mínima a timing attacks | ✅ (por libsodium) |
+| Wipe de memória sensível | ✅ |
+| Validação de timestamp | ✅ |
+| AEAD + Associated Data | ✅ |
+| Input sanitization com força bruta | ✅ |
+| Check de versão de payload | ✅ |
+| Hex encoding seguro | ✅ |
 
-## 📈 Benchmark (Baseado nos Testes Oficiais)
+---
 
-| Tamanho | Tempo Médio | Ops/s | Bytes/s |
-|---|---|---|---|
-| 10 Bytes | 300ms | ~3 ops/s | ~30 B/s |
-| 100 Bytes | 290ms | ~3.5 ops/s | ~340 B/s |
-| 1KB | 310ms | ~3 ops/s | ~3.2 KB/s |
-| 5KB | 350ms | ~2.8 ops/s | ~14 KB/s |
+## ✅ Casos de Uso (… Ou não)
 
-## ✅ Casos de Uso Sugeridos
+- ✅ Criptografar configs, tokens ou blobs pequenos que você PRECISA descriptografar depois.
+- ✅ Usar como segunda camada de proteção sobre uma cifra já existente (Double Encryption Lovers ❤️).
+- ❌ Não usar como substituto de bcrypt, Argon2id puro ou PBKDF2 para armazenamento de senhas.
 
-- Armazenamento de configurações sensíveis que precisam ser recuperáveis
-- Proteção de tokens, secrets ou chaves API
-- Uso em cenários onde é necessário descriptografar depois
+---
 
-> **⚠️ Importante:** Não substitui bcrypt, Argon2 ou outros hashes unidirecionais quando o caso for "armazenamento de senha irreversível".
+## 🚀 Como Compilar
 
-## 🧪 Resultados da Test Suite Interna
+```bash
+$ make
+```
 
-| Teste | Status |
+> Obs: Requer **libsodium >= 1.0.16**
+
+---
+
+## 🎯 Exemplos de Uso
+
+### Criptografar:
+
+```bash
+./v3 -e -k "MinhaSenhaForte123!" -m "Mensagem secreta"
+```
+
+### Decriptar:
+
+```bash
+./v3 -d -k "MinhaSenhaForte123!" -h "<hex_da_mensagem>"
+```
+
+### Teste de Vetor Interno:
+
+```bash
+./v3 -t
+```
+
+---
+
+## 🧪 Benchmark (No meu Ryzen 5 de pobre)
+
+| Tamanho | Tempo |
 |---|---|
-| Criptografia / Decriptação Básica | ✅ |
-| Corrupção de Payload | ✅ |
-| Corrupção de MAC | ✅ |
-| Dados Truncados | ✅ |
-| Chave Incorreta | ✅ |
-| Uniqueness de Saída | ✅ |
-| Compressão | ✅ |
-| Entropy Ratios | ✅ |
-| Entrada Inválida | ✅ |
-| Unicode | ✅ |
+| 10 bytes | ~150ms |
+| 1KB | ~160ms |
+| 10KB | ~180ms |
 
-## 📚 Melhorias Sugeridas para V4
+> **Obs:** Este código não nasceu pensando em performance. Nasceu pensando em deixar analistas forenses tristes.
 
-| Melhorias | Justificativa |
-|---|---|
-| Trocar LCG por CSPRNG real | Melhor distribuição estatística |
-| Adicionar AEAD nativo | Elimina necessidade de HMAC externo |
-| Permitir múltiplos tamanhos de chave | Mais flexibilidade |
-| Rate Limiting | Prevenção contra brute force |
+---
 
-## ✅ Conclusão
+## ⚠️ Aviso Final
 
-A **HardenedEntropyCipher V3** representa um avanço sólido, com excelente balanceamento entre segurança e performance.
+> **Este projeto é um laboratório criptográfico paranoico feito por puro amadorismo. Não use em produção. Não me processe. Não reclame depois.**
 
-**Status atual:** ✅ **Prótotipo.**
+Se você chegou até aqui e entendeu metade... parabéns, já está meio maluco também.
+
+---
+
+**Versão:** V3 - June 2025  
+**Autor:** Um dev que dorme abraçado com o manual do libsodium.
