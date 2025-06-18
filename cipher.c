@@ -9,8 +9,8 @@
 #include <errno.h>
 #include <ctype.h>
 #include <limits.h>
+#include <sys/mman.h>  
 
-// Security constants
 #define NONCE_SIZE crypto_aead_chacha20poly1305_IETF_NPUBBYTES
 #define KEY_SIZE crypto_aead_chacha20poly1305_IETF_KEYBYTES
 #define MAC_SIZE crypto_aead_chacha20poly1305_IETF_ABYTES
@@ -20,13 +20,20 @@
 #define MAX_HEX_SIZE (MAX_MSG_SIZE + HEADER_SIZE + MAC_SIZE) * 2
 #define MIN_PASSWORD_LENGTH 12
 #define MAX_PASSWORD_LENGTH 1024
-#define VERSION_BYTE 0x03
-#define TIMESTAMP_TOLERANCE_FUTURE 300    // 5 minutes
-#define TIMESTAMP_TOLERANCE_PAST (7 * 24 * 3600)  // 7 days (reduced from 30)
-#define OPSLIMIT crypto_pwhash_OPSLIMIT_INTERACTIVE
-#define MEMLIMIT crypto_pwhash_MEMLIMIT_INTERACTIVE
+#define VERSION_BYTE 0x04  
+#define TIMESTAMP_TOLERANCE_FUTURE 300    
+#define TIMESTAMP_TOLERANCE_PAST (24 * 3600)  
+#define MIN_ENTROPY_BITS 80.0  
+#define CACHE_LINE_SIZE 64     
 
-// Error codes with documentation
+#define OPSLIMIT_PRODUCTION 4  
+#define MEMLIMIT_PRODUCTION (64 * 1024 * 1024)  
+
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define CACHE_ALIGN __attribute__((aligned(CACHE_LINE_SIZE)))
+#define FORCE_INLINE __attribute__((always_inline)) inline
+
 typedef enum {
     CRYPTO_SUCCESS = 0,
     CRYPTO_ERROR_INIT = -1,
@@ -40,244 +47,303 @@ typedef enum {
     CRYPTO_ERROR_TIMESTAMP_INVALID = -9,
     CRYPTO_ERROR_DECRYPTION_FAILED = -10,
     CRYPTO_ERROR_INVALID_HEX = -11,
-    CRYPTO_ERROR_BUFFER_TOO_SMALL = -12
+    CRYPTO_ERROR_BUFFER_TOO_SMALL = -12,
+    CRYPTO_ERROR_RATE_LIMITED = -13
 } crypto_error_t;
 
-// Secure buffer structure for memory management
 typedef struct {
-    unsigned char *data;
+    unsigned char *data CACHE_ALIGN;
     size_t size;
     size_t capacity;
+    int locked;  
 } secure_buffer_t;
 
-// Function declarations
+typedef struct {
+    time_t last_operation;
+    int operation_count;
+    int max_ops_per_minute;
+} rate_limiter_t;
+
+static rate_limiter_t g_rate_limiter = {0, 0, 30};  
+
 static void secure_log(const char *level, const char *msg);
-static void secure_wipe(void *data, size_t len);
+static FORCE_INLINE void secure_wipe(void *data, size_t len);
 static crypto_error_t secure_buffer_init(secure_buffer_t *buf, size_t capacity);
 static void secure_buffer_free(secure_buffer_t *buf);
-static crypto_error_t validate_password_strength(const char *password);
-static crypto_error_t safe_hex_encode(const unsigned char *in, size_t in_len, char *out, size_t out_capacity);
-static crypto_error_t safe_hex_decode(const char *hex, unsigned char *out, size_t out_capacity, size_t *decoded_len);
-static crypto_error_t derive_key_secure(const char *password, const unsigned char *salt, unsigned char *key_out);
-static crypto_error_t validate_timestamp(uint64_t timestamp);
-static int is_valid_hex_string(const char *hex);
+static crypto_error_t validate_password_strength_optimized(const char *password);
+static FORCE_INLINE crypto_error_t safe_hex_encode_fast(const unsigned char *in, size_t in_len, char *out, size_t out_capacity);
+static FORCE_INLINE crypto_error_t safe_hex_decode_fast(const char *hex, unsigned char *out, size_t out_capacity, size_t *decoded_len);
+static crypto_error_t derive_key_optimized(const char *password, const unsigned char *salt, unsigned char *key_out);
+static FORCE_INLINE crypto_error_t validate_timestamp(uint64_t timestamp);
+static FORCE_INLINE int is_valid_hex_char(char c);
+static FORCE_INLINE int is_valid_hex_string_fast(const char *hex, size_t len);
 static const char* get_error_message(crypto_error_t error);
+static crypto_error_t check_rate_limit(void);
 
-// Secure logging with timestamp
+static const char hex_chars[16] = "0123456789abcdef";
+static const signed char hex_values[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,-1,-1,-1,-1,-1,-1,
+    -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+};
+
+static crypto_error_t check_rate_limit(void) {
+    time_t now = time(NULL);
+
+    if (now - g_rate_limiter.last_operation >= 60) {
+        g_rate_limiter.operation_count = 0;
+        g_rate_limiter.last_operation = now;
+    }
+
+    if (UNLIKELY(g_rate_limiter.operation_count >= g_rate_limiter.max_ops_per_minute)) {
+        secure_log("WARNING", "Rate limit exceeded");
+        return CRYPTO_ERROR_RATE_LIMITED;
+    }
+
+    g_rate_limiter.operation_count++;
+    return CRYPTO_SUCCESS;
+}
+
 static void secure_log(const char *level, const char *msg) {
+    static __thread char timestamp_buf[32];  
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
-    char timestamp[32];
-    
-    if (tm_info && strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info) > 0) {
-        fprintf(stderr, "[%s] %s: %s\n", timestamp, level, msg);
+
+    if (LIKELY(tm_info && strftime(timestamp_buf, sizeof(timestamp_buf), "%Y-%m-%d %H:%M:%S", tm_info) > 0)) {
+        fprintf(stderr, "[%s] %s: %s\n", timestamp_buf, level, msg);
     } else {
         fprintf(stderr, "%s: %s\n", level, msg);
     }
-    fflush(stderr);
 }
 
-// Secure memory wiping
-static void secure_wipe(void *data, size_t len) {
-    if (data && len > 0) {
+static FORCE_INLINE void secure_wipe(void *data, size_t len) {
+    if (LIKELY(data && len > 0)) {
         sodium_memzero(data, len);
     }
 }
 
-// Secure buffer management
 static crypto_error_t secure_buffer_init(secure_buffer_t *buf, size_t capacity) {
-    if (!buf || capacity == 0) {
+    if (UNLIKELY(!buf || capacity == 0)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
+
     buf->data = sodium_malloc(capacity);
-    if (!buf->data) {
+    if (UNLIKELY(!buf->data)) {
         secure_log("ERROR", "Failed to allocate secure memory");
         return CRYPTO_ERROR_MEMORY_ALLOCATION;
     }
-    
+
     buf->size = 0;
     buf->capacity = capacity;
+    buf->locked = 0;
+
+    #ifdef HAVE_MLOCK
+    if (mlock(buf->data, capacity) == 0) {
+        buf->locked = 1;
+    }
+    #endif
+
     return CRYPTO_SUCCESS;
 }
 
 static void secure_buffer_free(secure_buffer_t *buf) {
-    if (buf && buf->data) {
+    if (LIKELY(buf && buf->data)) {
+        #ifdef HAVE_MLOCK
+        if (buf->locked) {
+            munlock(buf->data, buf->capacity);
+        }
+        #endif
         sodium_free(buf->data);
         buf->data = NULL;
         buf->size = 0;
         buf->capacity = 0;
+        buf->locked = 0;
     }
 }
 
-// Enhanced password strength validation
-static crypto_error_t validate_password_strength(const char *password) {
-    if (!password) {
+static crypto_error_t validate_password_strength_optimized(const char *password) {
+    if (UNLIKELY(!password)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
-    size_t len = strlen(password);
-    if (len < MIN_PASSWORD_LENGTH) {
+
+    const size_t len = strlen(password);
+    if (UNLIKELY(len < MIN_PASSWORD_LENGTH)) {
         secure_log("WARNING", "Password too short");
         return CRYPTO_ERROR_WEAK_PASSWORD;
     }
-    
-    if (len > MAX_PASSWORD_LENGTH) {
+
+    if (UNLIKELY(len > MAX_PASSWORD_LENGTH)) {
         secure_log("ERROR", "Password too long");
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
-    // Character class analysis
-    int has_upper = 0, has_lower = 0, has_digit = 0, has_special = 0;
-    int char_classes = 0;
-    
+
+    uint8_t char_classes = 0;
+    const uint8_t HAS_UPPER = 1, HAS_LOWER = 2, HAS_DIGIT = 4, HAS_SPECIAL = 8;
+
     for (size_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)password[i];
-        
-        // Check for control characters
-        if (c < 32 || c == 127) {
+        const unsigned char c = (unsigned char)password[i];
+
+        if (UNLIKELY(c < 32 || c == 127)) {
             secure_log("ERROR", "Password contains invalid characters");
             return CRYPTO_ERROR_INVALID_INPUT;
         }
-        
-        if (c >= 'A' && c <= 'Z') has_upper = 1;
-        else if (c >= 'a' && c <= 'z') has_lower = 1;
-        else if (c >= '0' && c <= '9') has_digit = 1;
-        else has_special = 1;
+
+        if (c >= 'A' && c <= 'Z') char_classes |= HAS_UPPER;
+        else if (c >= 'a' && c <= 'z') char_classes |= HAS_LOWER;
+        else if (c >= '0' && c <= '9') char_classes |= HAS_DIGIT;
+        else char_classes |= HAS_SPECIAL;
+
+        if (char_classes == (HAS_UPPER | HAS_LOWER | HAS_DIGIT | HAS_SPECIAL)) {
+            break;
+        }
     }
-    
-    char_classes = has_upper + has_lower + has_digit + has_special;
-    
-    // Require at least 3 character classes for shorter passwords
-    if (len < 16 && char_classes < 3) {
+
+    const int class_count = __builtin_popcount(char_classes);
+
+    if (UNLIKELY(len < 16 && class_count < 3)) {
         secure_log("WARNING", "Password lacks complexity");
         return CRYPTO_ERROR_WEAK_PASSWORD;
     }
-    
-    // Calculate approximate entropy (conservative estimate)
+
     double charset_size = 0;
-    if (has_lower) charset_size += 26;
-    if (has_upper) charset_size += 26;
-    if (has_digit) charset_size += 10;
-    if (has_special) charset_size += 32; // Conservative estimate
-    
-    double entropy = log2(charset_size) * len;
-    
-    if (entropy < 60.0) {  // More reasonable entropy threshold
-        secure_log("WARNING", "Password entropy may be insufficient");
+    if (char_classes & HAS_LOWER) charset_size += 26;
+    if (char_classes & HAS_UPPER) charset_size += 26;
+    if (char_classes & HAS_DIGIT) charset_size += 10;
+    if (char_classes & HAS_SPECIAL) charset_size += 32;
+
+    const double entropy = log2(charset_size) * len;
+
+    if (UNLIKELY(entropy < MIN_ENTROPY_BITS)) {
+        secure_log("WARNING", "Password entropy insufficient");
         return CRYPTO_ERROR_WEAK_PASSWORD;
     }
-    
+
     return CRYPTO_SUCCESS;
 }
 
-// Safe hex encoding with bounds checking
-static crypto_error_t safe_hex_encode(const unsigned char *in, size_t in_len, char *out, size_t out_capacity) {
-    if (!in || !out || in_len == 0) {
+static FORCE_INLINE crypto_error_t safe_hex_encode_fast(const unsigned char *in, size_t in_len, char *out, size_t out_capacity) {
+    if (UNLIKELY(!in || !out || in_len == 0)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
-    if (out_capacity < (in_len * 2 + 1)) {
+
+    if (UNLIKELY(out_capacity < (in_len * 2 + 1))) {
         return CRYPTO_ERROR_BUFFER_TOO_SMALL;
     }
-    
-    for (size_t i = 0; i < in_len; i++) {
-        int written = snprintf(out + i * 2, 3, "%02x", in[i]);
-        if (written != 2) {
-            return CRYPTO_ERROR_INVALID_INPUT;
-        }
+
+    size_t i = 0;
+    for (; i + 3 < in_len; i += 4) {
+
+        out[i * 2] = hex_chars[in[i] >> 4];
+        out[i * 2 + 1] = hex_chars[in[i] & 0xF];
+        out[(i + 1) * 2] = hex_chars[in[i + 1] >> 4];
+        out[(i + 1) * 2 + 1] = hex_chars[in[i + 1] & 0xF];
+        out[(i + 2) * 2] = hex_chars[in[i + 2] >> 4];
+        out[(i + 2) * 2 + 1] = hex_chars[in[i + 2] & 0xF];
+        out[(i + 3) * 2] = hex_chars[in[i + 3] >> 4];
+        out[(i + 3) * 2 + 1] = hex_chars[in[i + 3] & 0xF];
     }
-    
+
+    for (; i < in_len; i++) {
+        out[i * 2] = hex_chars[in[i] >> 4];
+        out[i * 2 + 1] = hex_chars[in[i] & 0xF];
+    }
+
     out[in_len * 2] = '\0';
     return CRYPTO_SUCCESS;
 }
 
-// Validate hex string format
-static int is_valid_hex_string(const char *hex) {
-    if (!hex) return 0;
-    
-    size_t len = strlen(hex);
-    if (len == 0 || len % 2 != 0) return 0;
-    
+static FORCE_INLINE int is_valid_hex_char(char c) {
+    return hex_values[(unsigned char)c] >= 0;
+}
+
+static FORCE_INLINE int is_valid_hex_string_fast(const char *hex, size_t len) {
+    if (UNLIKELY(!hex || len == 0 || len % 2 != 0)) return 0;
+
     for (size_t i = 0; i < len; i++) {
-        if (!isxdigit((unsigned char)hex[i])) {
+        if (UNLIKELY(!is_valid_hex_char(hex[i]))) {
             return 0;
         }
     }
     return 1;
 }
 
-// Safe hex decoding with validation
-static crypto_error_t safe_hex_decode(const char *hex, unsigned char *out, size_t out_capacity, size_t *decoded_len) {
-    if (!hex || !out || !decoded_len) {
+static FORCE_INLINE crypto_error_t safe_hex_decode_fast(const char *hex, unsigned char *out, size_t out_capacity, size_t *decoded_len) {
+    if (UNLIKELY(!hex || !out || !decoded_len)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
-    if (!is_valid_hex_string(hex)) {
+
+    const size_t hex_len = strlen(hex);
+
+    if (UNLIKELY(!is_valid_hex_string_fast(hex, hex_len))) {
         return CRYPTO_ERROR_INVALID_HEX;
     }
-    
-    size_t hex_len = strlen(hex);
-    size_t expected_len = hex_len / 2;
-    
-    if (expected_len > out_capacity) {
+
+    const size_t expected_len = hex_len / 2;
+
+    if (UNLIKELY(expected_len > out_capacity)) {
         return CRYPTO_ERROR_BUFFER_TOO_SMALL;
     }
-    
+
     for (size_t i = 0; i < expected_len; i++) {
-        unsigned int byte_val;
-        if (sscanf(hex + 2 * i, "%2x", &byte_val) != 1) {
-            return CRYPTO_ERROR_INVALID_HEX;
-        }   
-        out[i] = (unsigned char)byte_val;
+        const signed char high = hex_values[(unsigned char)hex[2 * i]];
+        const signed char low = hex_values[(unsigned char)hex[2 * i + 1]];
+        out[i] = (unsigned char)((high << 4) | low);
     }
-    
+
     *decoded_len = expected_len;
     return CRYPTO_SUCCESS;
 }
 
-// Secure key derivation
-static crypto_error_t derive_key_secure(const char *password, const unsigned char *salt, unsigned char *key_out) {
-    if (!password || !salt || !key_out) {
+static crypto_error_t derive_key_optimized(const char *password, const unsigned char *salt, unsigned char *key_out) {
+    if (UNLIKELY(!password || !salt || !key_out)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
-    size_t pw_len = strlen(password);
-    if (pw_len == 0 || pw_len > MAX_PASSWORD_LENGTH) {
+
+    const size_t pw_len = strlen(password);
+    if (UNLIKELY(pw_len == 0 || pw_len > MAX_PASSWORD_LENGTH)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
-    int result = crypto_pwhash(
+
+    const int result = crypto_pwhash(
         key_out, KEY_SIZE,
         password, pw_len,
         salt,
-        OPSLIMIT, MEMLIMIT,
+        OPSLIMIT_PRODUCTION, MEMLIMIT_PRODUCTION,
         crypto_pwhash_ALG_ARGON2ID13
     );
-    
+
     return (result == 0) ? CRYPTO_SUCCESS : CRYPTO_ERROR_KEY_DERIVATION;
 }
 
-// Validate timestamp with reasonable bounds
-static crypto_error_t validate_timestamp(uint64_t timestamp) {
-    uint64_t now = (uint64_t)time(NULL);
-    
-    // Check for future timestamps (allow small clock skew)
-    if (timestamp > now + TIMESTAMP_TOLERANCE_FUTURE) {
+static FORCE_INLINE crypto_error_t validate_timestamp(uint64_t timestamp) {
+    const uint64_t now = (uint64_t)time(NULL);
+
+    if (UNLIKELY(timestamp > now + TIMESTAMP_TOLERANCE_FUTURE)) {
         secure_log("WARNING", "Timestamp too far in future");
         return CRYPTO_ERROR_TIMESTAMP_INVALID;
     }
-    
-    // Check for old timestamps
-    if (timestamp < now - TIMESTAMP_TOLERANCE_PAST) {
+
+    if (UNLIKELY(timestamp < now - TIMESTAMP_TOLERANCE_PAST)) {
         secure_log("WARNING", "Timestamp too old");
         return CRYPTO_ERROR_TIMESTAMP_INVALID;
     }
-    
+
     return CRYPTO_SUCCESS;
 }
 
-// Get human-readable error message
 static const char* get_error_message(crypto_error_t error) {
     switch (error) {
         case CRYPTO_SUCCESS: return "Success";
@@ -293,63 +359,61 @@ static const char* get_error_message(crypto_error_t error) {
         case CRYPTO_ERROR_DECRYPTION_FAILED: return "Decryption failed - wrong password or corrupted data";
         case CRYPTO_ERROR_INVALID_HEX: return "Invalid hexadecimal format";
         case CRYPTO_ERROR_BUFFER_TOO_SMALL: return "Buffer too small for operation";
+        case CRYPTO_ERROR_RATE_LIMITED: return "Rate limit exceeded - too many operations";
         default: return "Unknown error";
     }
 }
 
-// Main encryption function
 crypto_error_t encrypt_message(const char *password, const char *message, char **hex_output) {
-    if (!password || !message || !hex_output) {
+    if (UNLIKELY(!password || !message || !hex_output)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
+
     *hex_output = NULL;
-    
-    // Initialize libsodium
-    if (sodium_init() < 0) {
+
+    crypto_error_t rate_result = check_rate_limit();
+    if (UNLIKELY(rate_result != CRYPTO_SUCCESS)) {
+        return rate_result;
+    }
+
+    if (UNLIKELY(sodium_init() < 0)) {
         secure_log("ERROR", "Failed to initialize cryptographic library");
         return CRYPTO_ERROR_INIT;
     }
-    
-    // Validate password strength
-    crypto_error_t pw_result = validate_password_strength(password);
-    if (pw_result != CRYPTO_SUCCESS) {
+
+    crypto_error_t pw_result = validate_password_strength_optimized(password);
+    if (UNLIKELY(pw_result != CRYPTO_SUCCESS)) {
         return pw_result;
     }
-    
-    // Check message size
-    size_t msg_len = strlen(message);
-    if (msg_len > MAX_MSG_SIZE) {
+
+    const size_t msg_len = strlen(message);
+    if (UNLIKELY(msg_len > MAX_MSG_SIZE)) {
         secure_log("ERROR", "Message too large");
         return CRYPTO_ERROR_MESSAGE_TOO_LARGE;
     }
-    
-    // Generate cryptographic material
-    unsigned char salt[SALT_SIZE];
-    unsigned char nonce[NONCE_SIZE];
-    uint64_t timestamp = (uint64_t)time(NULL);
-    
+
+    unsigned char salt[SALT_SIZE] CACHE_ALIGN;
+    unsigned char nonce[NONCE_SIZE] CACHE_ALIGN;
+    const uint64_t timestamp = (uint64_t)time(NULL);
+
     randombytes_buf(salt, SALT_SIZE);
     randombytes_buf(nonce, NONCE_SIZE);
-    
-    // Derive encryption key
-    unsigned char key[KEY_SIZE];
-    crypto_error_t key_result = derive_key_secure(password, salt, key);
-    if (key_result != CRYPTO_SUCCESS) {
+
+    unsigned char key[KEY_SIZE] CACHE_ALIGN;
+    crypto_error_t key_result = derive_key_optimized(password, salt, key);
+    if (UNLIKELY(key_result != CRYPTO_SUCCESS)) {
         secure_wipe(key, KEY_SIZE);
         return key_result;
     }
-    
-    // Allocate output buffer
+
     secure_buffer_t output_buf;
-    size_t total_len = HEADER_SIZE + msg_len + MAC_SIZE;
+    const size_t total_len = HEADER_SIZE + msg_len + MAC_SIZE;
     crypto_error_t buf_result = secure_buffer_init(&output_buf, total_len);
-    if (buf_result != CRYPTO_SUCCESS) {
+    if (UNLIKELY(buf_result != CRYPTO_SUCCESS)) {
         secure_wipe(key, KEY_SIZE);
         return buf_result;
     }
-    
-    // Build header
+
     size_t pos = 0;
     output_buf.data[pos++] = VERSION_BYTE;
     memcpy(output_buf.data + pos, salt, SALT_SIZE);
@@ -358,181 +422,171 @@ crypto_error_t encrypt_message(const char *password, const char *message, char *
     pos += NONCE_SIZE;
     memcpy(output_buf.data + pos, &timestamp, 8);
     pos += 8;
-    
-    // Encrypt message
+
     unsigned long long ciphertext_len = 0;
-    int encrypt_result = crypto_aead_chacha20poly1305_ietf_encrypt(
+    const int encrypt_result = crypto_aead_chacha20poly1305_ietf_encrypt(
         output_buf.data + HEADER_SIZE, &ciphertext_len,
         (const unsigned char*)message, msg_len,
-        output_buf.data, HEADER_SIZE,  // Additional data (header)
-        NULL,  // No secret nonce
+        output_buf.data, HEADER_SIZE,  
+        NULL,  
         nonce, key
     );
-    
+
     secure_wipe(key, KEY_SIZE);
-    
-    if (encrypt_result != 0) {
+
+    if (UNLIKELY(encrypt_result != 0)) {
         secure_buffer_free(&output_buf);
         secure_log("ERROR", "Encryption failed");
         return CRYPTO_ERROR_ENCRYPTION_FAILED;
     }
-    
+
     output_buf.size = HEADER_SIZE + ciphertext_len;
-    
-    // Convert to hex
-    size_t hex_len = output_buf.size * 2 + 1;
+
+    const size_t hex_len = output_buf.size * 2 + 1;
     *hex_output = malloc(hex_len);
-    if (!*hex_output) {
+    if (UNLIKELY(!*hex_output)) {
         secure_buffer_free(&output_buf);
         return CRYPTO_ERROR_MEMORY_ALLOCATION;
     }
-    
-    crypto_error_t hex_result = safe_hex_encode(output_buf.data, output_buf.size, *hex_output, hex_len);
+
+    crypto_error_t hex_result = safe_hex_encode_fast(output_buf.data, output_buf.size, *hex_output, hex_len);
     secure_buffer_free(&output_buf);
-    
-    if (hex_result != CRYPTO_SUCCESS) {
+
+    if (UNLIKELY(hex_result != CRYPTO_SUCCESS)) {
         free(*hex_output);
         *hex_output = NULL;
         return hex_result;
     }
-    
-    secure_log("INFO", "Message encrypted successfully");
+
     return CRYPTO_SUCCESS;
 }
 
-// Main decryption function
 crypto_error_t decrypt_message(const char *password, const char *hex_input, char **plaintext_output) {
-    if (!password || !hex_input || !plaintext_output) {
+    if (UNLIKELY(!password || !hex_input || !plaintext_output)) {
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
+
     *plaintext_output = NULL;
-    
-    // Initialize libsodium
-    if (sodium_init() < 0) {
+
+    crypto_error_t rate_result = check_rate_limit();
+    if (UNLIKELY(rate_result != CRYPTO_SUCCESS)) {
+        return rate_result;
+    }
+
+    if (UNLIKELY(sodium_init() < 0)) {
         secure_log("ERROR", "Failed to initialize cryptographic library");
         return CRYPTO_ERROR_INIT;
     }
-    
-    // Decode hex input
+
     secure_buffer_t input_buf;
     crypto_error_t buf_result = secure_buffer_init(&input_buf, MAX_MSG_SIZE + HEADER_SIZE + MAC_SIZE);
-    if (buf_result != CRYPTO_SUCCESS) {
+    if (UNLIKELY(buf_result != CRYPTO_SUCCESS)) {
         return buf_result;
     }
-    
+
     size_t decoded_len;
-    crypto_error_t decode_result = safe_hex_decode(hex_input, input_buf.data, input_buf.capacity, &decoded_len);
-    if (decode_result != CRYPTO_SUCCESS) {
+    crypto_error_t decode_result = safe_hex_decode_fast(hex_input, input_buf.data, input_buf.capacity, &decoded_len);
+    if (UNLIKELY(decode_result != CRYPTO_SUCCESS)) {
         secure_buffer_free(&input_buf);
         return decode_result;
     }
-    
+
     input_buf.size = decoded_len;
-    
-    // Validate minimum size
-    if (input_buf.size < HEADER_SIZE + MAC_SIZE) {
+
+    if (UNLIKELY(input_buf.size < HEADER_SIZE + MAC_SIZE)) {
         secure_buffer_free(&input_buf);
         secure_log("ERROR", "Input too short");
         return CRYPTO_ERROR_INVALID_INPUT;
     }
-    
-    // Parse header
+
     size_t pos = 0;
-    unsigned char version = input_buf.data[pos++];
-    if (version != VERSION_BYTE) {
+    const unsigned char version = input_buf.data[pos++];
+    if (UNLIKELY(version != VERSION_BYTE)) {
         secure_buffer_free(&input_buf);
         secure_log("ERROR", "Unsupported version");
         return CRYPTO_ERROR_INVALID_VERSION;
     }
-    
-    unsigned char salt[SALT_SIZE];
+
+    unsigned char salt[SALT_SIZE] CACHE_ALIGN;
     memcpy(salt, input_buf.data + pos, SALT_SIZE);
     pos += SALT_SIZE;
-    
-    unsigned char nonce[NONCE_SIZE];
+
+    unsigned char nonce[NONCE_SIZE] CACHE_ALIGN;
     memcpy(nonce, input_buf.data + pos, NONCE_SIZE);
     pos += NONCE_SIZE;
-    
+
     uint64_t timestamp;
     memcpy(&timestamp, input_buf.data + pos, 8);
     pos += 8;
-    
-    // Validate timestamp
+
     crypto_error_t ts_result = validate_timestamp(timestamp);
-    if (ts_result != CRYPTO_SUCCESS) {
+    if (UNLIKELY(ts_result != CRYPTO_SUCCESS)) {
         secure_buffer_free(&input_buf);
         return ts_result;
     }
-    
-    // Derive decryption key
-    unsigned char key[KEY_SIZE];
-    crypto_error_t key_result = derive_key_secure(password, salt, key);
-    if (key_result != CRYPTO_SUCCESS) {
+
+    unsigned char key[KEY_SIZE] CACHE_ALIGN;
+    crypto_error_t key_result = derive_key_optimized(password, salt, key);
+    if (UNLIKELY(key_result != CRYPTO_SUCCESS)) {
         secure_buffer_free(&input_buf);
         secure_wipe(key, KEY_SIZE);
         return key_result;
     }
-    
-    // Decrypt message
+
     secure_buffer_t plaintext_buf;
     crypto_error_t pt_buf_result = secure_buffer_init(&plaintext_buf, MAX_MSG_SIZE);
-    if (pt_buf_result != CRYPTO_SUCCESS) {
+    if (UNLIKELY(pt_buf_result != CRYPTO_SUCCESS)) {
         secure_buffer_free(&input_buf);
         secure_wipe(key, KEY_SIZE);
         return pt_buf_result;
     }
-    
-    size_t ciphertext_len = input_buf.size - HEADER_SIZE;
+
+    const size_t ciphertext_len = input_buf.size - HEADER_SIZE;
     unsigned long long plaintext_len;
-    
-    int decrypt_result = crypto_aead_chacha20poly1305_ietf_decrypt(
+
+    const int decrypt_result = crypto_aead_chacha20poly1305_ietf_decrypt(
         plaintext_buf.data, &plaintext_len,
         NULL,
         input_buf.data + HEADER_SIZE, ciphertext_len,
-        input_buf.data, HEADER_SIZE,  // Additional data (header)
+        input_buf.data, HEADER_SIZE,  
         nonce, key
     );
-    
+
     secure_wipe(key, KEY_SIZE);
     secure_buffer_free(&input_buf);
-    
-    if (decrypt_result != 0) {
+
+    if (UNLIKELY(decrypt_result != 0)) {
         secure_buffer_free(&plaintext_buf);
         secure_log("ERROR", "Decryption failed");
         return CRYPTO_ERROR_DECRYPTION_FAILED;
     }
-    
-    // Allocate output string
+
     *plaintext_output = malloc(plaintext_len + 1);
-    if (!*plaintext_output) {
+    if (UNLIKELY(!*plaintext_output)) {
         secure_buffer_free(&plaintext_buf);
         return CRYPTO_ERROR_MEMORY_ALLOCATION;
     }
-    
+
     memcpy(*plaintext_output, plaintext_buf.data, plaintext_len);
     (*plaintext_output)[plaintext_len] = '\0';
-    
+
     secure_buffer_free(&plaintext_buf);
-    secure_log("INFO", "Message decrypted successfully");
     return CRYPTO_SUCCESS;
 }
 
-// Test vector generation for verification
 void generate_test_vector(void) {
     const char *test_password = "SecureTestPassword123!@#";
     const char *test_message = "This is a test message for cryptographic verification.";
     char *encrypted_hex = NULL;
-    
+
     printf("=== Cryptographic Test Vector ===\n");
     printf("Password: %s\n", test_password);
     printf("Message: %s\n", test_message);
-    
+
     crypto_error_t result = encrypt_message(test_password, test_message, &encrypted_hex);
     if (result == CRYPTO_SUCCESS && encrypted_hex) {
         printf("Encrypted (hex): %s\n", encrypted_hex);
-        
-        // Test decryption
+
         char *decrypted = NULL;
         crypto_error_t decrypt_result = decrypt_message(test_password, encrypted_hex, &decrypted);
         if (decrypt_result == CRYPTO_SUCCESS && decrypted) {
@@ -542,7 +596,7 @@ void generate_test_vector(void) {
         } else {
             printf("Decryption failed: %s\n", get_error_message(decrypt_result));
         }
-        
+
         free(encrypted_hex);
     } else {
         printf("Encryption failed: %s\n", get_error_message(result));
@@ -550,7 +604,6 @@ void generate_test_vector(void) {
     printf("================================\n");
 }
 
-// Usage information
 void print_usage(const char *program_name) {
     printf("\nSecure Encryption Tool\n");
     printf("Usage:\n");
@@ -566,7 +619,6 @@ void print_usage(const char *program_name) {
     printf("\n");
 }
 
-// Enhanced argument parsing
 typedef struct {
     char *password;
     char *message;
@@ -579,12 +631,12 @@ typedef struct {
 
 static crypto_error_t parse_arguments(int argc, char *argv[], program_args_t *args) {
     memset(args, 0, sizeof(*args));
-    
+
     if (argc < 2) {
         args->help_mode = 1;
         return CRYPTO_SUCCESS;
     }
-    
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-e") == 0) {
             args->encrypt_mode = 1;
@@ -598,41 +650,41 @@ static crypto_error_t parse_arguments(int argc, char *argv[], program_args_t *ar
             args->password = argv[++i];
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             args->message = argv[++i];
-        } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {  // Usando -x pra hex input
+        } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {  
             args->hex_data = argv[++i];
         } else {
             secure_log("ERROR", "Unknown argument");
             return CRYPTO_ERROR_INVALID_INPUT;
         }
     }
-    
+
     return CRYPTO_SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
     program_args_t args;
     crypto_error_t parse_result = parse_arguments(argc, argv, &args);
-    
+
     if (parse_result != CRYPTO_SUCCESS || args.help_mode) {
         print_usage(argv[0]);
         return (parse_result == CRYPTO_SUCCESS) ? 0 : 1;
     }
-    
+
     if (args.test_mode) {
         generate_test_vector();
         return 0;
     }
-    
+
     if (args.encrypt_mode) {
         if (!args.password || !args.message) {
             fprintf(stderr, "Error: Encryption requires password (-k) and message (-m)\n");
             print_usage(argv[0]);
             return 1;
         }
-        
+
         char *encrypted_hex = NULL;
         crypto_error_t result = encrypt_message(args.password, args.message, &encrypted_hex);
-        
+
         if (result == CRYPTO_SUCCESS && encrypted_hex) {
             printf("%s\n", encrypted_hex);
             free(encrypted_hex);
@@ -642,17 +694,17 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
-    
+
     if (args.decrypt_mode) {
         if (!args.password || !args.hex_data) {
             fprintf(stderr, "Error: Decryption requires password (-k) and hex data (-h)\n");
             print_usage(argv[0]);
             return 1;
         }
-        
+
         char *decrypted_message = NULL;
         crypto_error_t result = decrypt_message(args.password, args.hex_data, &decrypted_message);
-        
+
         if (result == CRYPTO_SUCCESS && decrypted_message) {
             printf("%s\n", decrypted_message);
             free(decrypted_message);
@@ -662,7 +714,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
-    
+
     fprintf(stderr, "Error: Must specify operation mode (-e, -d, or -t)\n");
     print_usage(argv[0]);
     return 1;
