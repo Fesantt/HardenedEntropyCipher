@@ -23,7 +23,7 @@ O binário espera argumentos:
 ./vault -t #Teste
 ```
 
-## Dicas Sutis
+## Dicas
 
 - O **test vector** interno pode revelar detalhes úteis…
 - Atenção à **ordem de bytes** do timestamp: little-endian.
@@ -34,6 +34,7 @@ O binário espera argumentos:
 - Formato hex espera **pares de dígitos**: uma letra a mais ou a menos falha.
 - A biblioteca não zera todos os buffers: patters repetidos podem vazar.
 - O timestamp tem tolerância finita (futuro e passado) — explorar datas fora do intervalo.
+- Você tem acesso total ao codigo fonte, podendo fazer o que quiser. Esta contido no cipher.c
 
 ## Como Submeter
 
