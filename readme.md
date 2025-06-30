@@ -36,6 +36,14 @@ O binário espera argumentos:
 - O timestamp tem tolerância finita (futuro e passado) — explorar datas fora do intervalo.
 - Você tem acesso total ao codigo fonte, podendo fazer o que quiser. Esta contido no cipher.c
 
+```
+"Às vezes, a segurança é vítima de seus próprios padrões."
+
+"O passado pode voltar... se você controlar o tempo."
+
+"A resposta está nos detalhes esquecidos."
+```
+
 ## Como Submeter
 
 1. Decripte o hex fornecido.
