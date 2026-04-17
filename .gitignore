@@ -1,0 +1,40 @@
+# C build artifacts
+v3
+v3.exe
+
+# .NET build output
+bin/
+obj/
+publish/
+
+# NuGet
+*.nupkg
+*.snupkg
+project.assets.json
+project.nuget.cache
+*.nuget.props
+*.nuget.targets
+packages/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docview
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+
+# VS Code
+.vscode/
+
+# Test artifacts
+*.hec
+test_*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
