@@ -4,7 +4,7 @@ Cifra **não-determinística**, **reversível**, com **entropia embutida** — r
 
 > Mesmo plaintext + mesma senha → outputs **sempre diferentes**. Matematicamente garantido.
 
----
+
 
 ## Características
 
